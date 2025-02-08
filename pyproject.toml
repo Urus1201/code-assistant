@@ -1,0 +1,4 @@
+[tool.poetry]
+name = "codecraft-assistant"
+version = "0.1.0"
+description = "An intelligent code assistant that helps plan and execute software development tasks"
