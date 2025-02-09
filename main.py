@@ -103,12 +103,8 @@ def main():
                 break
 
             stream_graph_updates(workflow, user_input)
-        except:
-            # Fallback if input() is not available
-            user_input = "What do you know about LangGraph?"
-            print("User: " + user_input)
-            stream_graph_updates(workflow, user_input)
-            break
+        except Exception as e:
+           return e
 
 if __name__ == "__main__":
     main()

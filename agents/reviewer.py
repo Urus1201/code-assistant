@@ -7,29 +7,40 @@ class ReviewerAgent:
     def __init__(self, llm):
         self.llm = llm
 
-    def review_and_refine(self, project_path: str):
+    def review_and_refine(self, state: dict) -> dict:
+        plan = state.get("plan", {})
+        context = plan.get("context", {})
+        project_path = context.get("last_created_dir", "project")
         logger.info(f"Reviewing code in {project_path}")
         
         try:
-            main_code = self._read_file(Path(project_path) / "main.py")
-            test_code = self._read_file(Path(project_path) / "test_factorial.py")
-
-            if self.llm:
-                review = self.llm.chat(
-                    f"Review this Python code:\n\n{main_code}\n\nTests:\n{test_code}",
-                    system_message="Analyze the code for bugs, improvements, and best practices.",
-                    assistant_name="reviewer"
-                )
-                logger.info(f"Code review results:\n{review}")
-                
-                # Implement suggestions from review
-                self._implement_suggestions(review, project_path)
+            # Try main.py; if not present, fall back to last_created_file from context
+            main_path = Path(project_path) / "main.py"
+            if not main_path.exists():
+                alt = context.get("last_created_file", "")
+                main_path = Path(project_path) / alt if alt else main_path
+            test_path = Path(project_path) / "test_sum_even_numbers.py"
             
-            return True
+            main_code = self._read_file(main_path)
+            test_code = self._read_file(test_path)
+            
+            if self.llm:
+                # Use invoke instead of chat
+                review = self.llm.invoke([{
+                    "role": "user",
+                    "content": f"Review this Python code:\n\n{main_code}\n\nTests:\n{test_code}"
+                }]).content
+                logger.info(f"Code review results:\n{review}")
+                self._implement_suggestions(review, project_path)
+                state.setdefault("messages", []).append(
+                    {"role": "system", "content": f"Reviewer comments: {review}"}
+                )
+            return state
 
         except Exception as e:
             logger.error(f"Error during code review: {e}")
-            return False
+            state.setdefault("errors", []).append(str(e))
+            return state
 
     def _implement_suggestions(self, review: str, project_path: str):
         """Implement suggestions from the code review."""
@@ -42,10 +53,8 @@ class ReviewerAgent:
             Return only the improved code without explanations.
             """
             try:
-                improved_code = self.llm.chat(
-                    prompt,
-                    assistant_name="reviewer"
-                )
+                # Remove unsupported assistant_name parameter
+                improved_code = self.llm.invoke(prompt)
                 if improved_code:
                     self._write_improved_code(improved_code, project_path)
             except Exception as e:

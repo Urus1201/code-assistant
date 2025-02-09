@@ -1,6 +1,7 @@
-import os
-import subprocess
 from pathlib import Path
+import subprocess
+from typing import Dict, Any, Optional
+from .types import Plan, Action, ActionType, ActionResult, ValidationResult
 import logging
 
 logger = logging.getLogger(__name__)
@@ -8,136 +9,160 @@ logger = logging.getLogger(__name__)
 class ExecutorAgent:
     def __init__(self, llm):
         self.llm = llm
+        self.action_handlers = {
+            ActionType.CREATE_DIR: self._handle_create_dir,
+            ActionType.CREATE_FILE: self._handle_create_file,
+            ActionType.CREATE_VENV: self._handle_create_venv,
+            ActionType.INSTALL_DEPS: self._handle_install_deps,
+            ActionType.RUN_COMMAND: self._handle_run_command,
+            ActionType.CUSTOM: self._handle_custom_action
+        }
 
-    def execute_plan(self, plan: list):
-        for step in plan:
+    def execute_plan(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        plan: Plan = state["plan"]
+        context = plan["context"]
+        
+        # import pdb; pdb.set_trace()
+        while True:
+            current_action = self._get_next_action(plan)
+            if not current_action:
+                break  # No more pending actions
+
             try:
-                logger.info(f"Executing step: {step}")
-                if "Create directory" in step:
-                    self._create_directory("factorial_app")
-                elif "Initialize Python virtual environment" in step:
-                    self._create_venv("factorial_app/.venv")
-                elif "Generate requirements.txt" in step:
-                    requirements = ["click"]
-                    self._write_requirements("factorial_app/requirements.txt", requirements)
-                elif "Generate main.py" in step:
-                    code = self._generate_main_py()
-                    self._write_file("factorial_app/main.py", code)
-                elif "Generate test_factorial.py" in step:
-                    test_code = self._generate_test_py()
-                    self._write_file("factorial_app/test_factorial.py", test_code)
-                elif "Install dependencies" in step:
-                    self._install_requirements("factorial_app/.venv", "factorial_app/requirements.txt")
-                else:
-                    logger.warning(f"Unknown step: {step}")
+                result = self._execute_action(current_action, context)
+                validation = self._validate_action(current_action, result)
+                
+                current_action["result"] = {
+                    "success": validation["success"],
+                    "output": result.get("output"),
+                    "error": result.get("error"),
+                    "validation": validation
+                }
+                
+                context.update(self._extract_context_updates(current_action))
             except Exception as e:
-                logger.error(f"Error executing step {step}: {str(e)}")
-                raise
+                logger.error(f"Action execution failed: {e}")
+                state.setdefault("errors", []).append(str(e))
+                return self.update_state(state, {
+                    "status": "error",
+                    "next": "monitoring"
+                })
+        
+        return self.update_state(state, {
+            "plan": plan,
+            "context": context,
+            "status": "completed",
+            "next": "reviewer"
+        })
 
-    def _create_directory(self, path_str: str):
-        path = Path(path_str)
-        path.mkdir(exist_ok=True, parents=True)
-        logger.info(f"Created directory: {path_str}")
+    def _get_next_action(self, plan: Plan) -> Optional[Action]:
+        """Find next action where all dependencies are completed successfully"""
+        for action in plan["actions"]:
+            if not action.get("result"):  # Not executed yet
+                dependencies_met = all(
+                    self._is_action_completed(plan, dep_id)
+                    for dep_id in action.get("dependencies", [])
+                )
+                if dependencies_met:
+                    return action
+        return None
 
-    def _create_venv(self, venv_path_str: str):
-        venv_path = Path(venv_path_str)
-        try:
-            if not venv_path.exists():
-                subprocess.run(["python", "-m", "venv", venv_path_str], check=True)
-            logger.info(f"Created virtual env: {venv_path_str}")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to create virtual environment: {e}")
-            raise
+    def _is_action_completed(self, plan: Plan, action_id: str) -> bool:
+        """Check if an action completed successfully"""
+        for action in plan["actions"]:
+            if action["id"] == action_id:
+                result = action.get("result")
+                return result and result["success"]
+        return False
 
-    def _write_requirements(self, file_path: str, requirements: list):
-        with open(file_path, "w") as f:
-            for req in requirements:
-                f.write(req + "\n")
-        logger.info(f"Wrote requirements.txt: {requirements}")
+    def _extract_context_updates(self, action: Action) -> Dict[str, Any]:
+        """Extract relevant information from action result to update context"""
+        result = action.get("result")
+        if not result or not result["success"]:
+            return {}
+            
+        updates = {}
+        if action["type"] == ActionType.CREATE_DIR:
+            updates["last_created_dir"] = action["params"]["path"]
+        elif action["type"] == ActionType.CREATE_FILE:
+            updates["last_created_file"] = action["params"]["path"]
+        # Add more context updates based on action types...
+        
+        return updates
 
-    def _generate_main_py(self) -> str:
-        return """\
-import click
+    def _execute_action(self, action: Action, context: Dict[str, Any]) -> ActionResult:
+        handler = self.action_handlers.get(ActionType(action["type"]))
+        if handler:
+            return handler(action["params"])
+        raise ValueError(f"Unknown action type: {action['type']}")
 
-def factorial(n: int) -> int:
-    if n <= 1:
-        return 1
-    return n * factorial(n-1)
-
-@click.command()
-@click.argument('number', type=int)
-def main(number):
-    \"""
-    Calculate factorial of a given integer.
-    \"""
-    result = factorial(number)
-    click.echo(f"Factorial of {number} is {result}")
-
-if __name__ == '__main__':
-    main()
-"""
-
-    def _generate_test_py(self) -> str:
-        return """\
-import unittest
-from main import factorial
-
-class TestFactorial(unittest.TestCase):
-    def test_factorial_0(self):
-        self.assertEqual(factorial(0), 1)
-
-    def test_factorial_1(self):
-        self.assertEqual(factorial(1), 1)
-
-    def test_factorial_5(self):
-        self.assertEqual(factorial(5), 120)
-
-if __name__ == '__main__':
-    unittest.main()
-"""
-
-    def _write_file(self, file_path: str, code: str):
-        with open(file_path, "w") as f:
-            f.write(code)
-        logger.info(f"Wrote file: {file_path}")
-
-    def _install_requirements(self, venv_path_str: str, req_file_str: str):
-        try:
-            if os.name == "nt":
-                pip_executable = Path(venv_path_str) / "Scripts" / "pip.exe"
-            else:
-                pip_executable = Path(venv_path_str) / "bin" / "pip"
-            subprocess.run([str(pip_executable), "install", "-r", req_file_str], check=True)
-            logger.info("Installed dependencies")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to install dependencies: {e}")
-            raise
-
-    def install_module(self, module_name: str):
-        try:
-            subprocess.run(["pip", "install", module_name], check=True)
-            logger.info(f"Installed module: {module_name}")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to install module {module_name}: {e}")
-            raise
-
-    def check_file_path(self, file_path: str):
-        if not Path(file_path).exists():
-            logger.error(f"File path does not exist: {file_path}")
-            raise FileNotFoundError(f"File not found: {file_path}")
-        logger.info(f"File path is valid: {file_path}")
-
-    def fix_code(self, error_type: str):
-        # In a real scenario, this would use an LLM to modify the code.
-        if error_type == "undefined_variable":
-            logger.warning("Attempting to fix undefined variable error (dummy fix)")
-            # Dummy fix: Add a variable definition to main.py
-            main_py_path = Path("factorial_app") / "main.py"
-            with open(main_py_path, "a") as f:
-                f.write("\n# Dummy fix: Define missing variable\nmissing_variable = 0\n")
+    def _validate_action(self, action: Action, result: ActionResult) -> ValidationResult:
+        if not action.get("validation"):
+            return {"success": True}
+            
+        validation = action["validation"]
+        if validation["type"] == "file_exists":
+            success = Path(validation["criteria"]).exists()
+        elif validation["type"] == "command_output":
+            try:
+                subprocess.run(
+                    validation["criteria"],
+                    shell=True,
+                    check=True,
+                    capture_output=True
+                )
+                success = True
+            except subprocess.CalledProcessError:
+                success = False
         else:
-            logger.warning("Attempting to fix general code error (dummy fix)")
-            # Dummy fix: Add a comment to main.py
-            main_py_path = Path("factorial_app") / "main.py"
-            with open(main_py_path, "a") as f:
-                f.write("\n# Dummy fix: General code fix\n")
+            success = False
+        
+        return {"success": success, "message": validation.get("message", "")}
+
+    def _handle_create_dir(self, params: dict) -> ActionResult:
+        path = Path(params["path"])
+        path.mkdir(exist_ok=True, parents=True)
+        logger.info(f"Created directory: {path}")
+        return {"output": f"Created directory: {path}"}
+
+    def _handle_create_file(self, params: dict) -> ActionResult:
+        path = Path(params["path"])
+        path.parent.mkdir(exist_ok=True, parents=True)
+        # Convert literal "\n" sequences to actual newlines
+        content = params["content"].encode().decode("unicode_escape")
+        path.write_text(content)
+        # Allow filesystem update to complete
+        import time
+        time.sleep(0.1)
+        logger.info(f"Created file: {path}")
+        return {"output": f"Created file: {path}"}
+
+    def _handle_create_venv(self, params: dict) -> ActionResult:
+        subprocess.run(["python", "-m", "venv", params["path"]], check=True)
+        logger.info(f"Created virtual environment: {params['path']}")
+        return {"output": f"Created virtual environment: {params['path']}"}
+
+    def _handle_install_deps(self, params: dict) -> ActionResult:
+        subprocess.run(["pip", "install"] + params["packages"], check=True)
+        logger.info(f"Installed dependencies: {params['packages']}")
+        return {"output": f"Installed dependencies: {params['packages']}"}
+
+    def _handle_run_command(self, params: dict) -> ActionResult:
+        subprocess.run(params["command"], shell=True, check=True)
+        logger.info(f"Ran command: {params['command']}")
+        return {"output": f"Ran command: {params['command']}"}
+
+    def _handle_custom_action(self, params: dict) -> ActionResult:
+        if self.llm:
+            # Use LLM to handle custom actions
+            response = self.llm.invoke([{
+                "role": "user",
+                "content": f"How to implement this custom action: {params['description']}"
+            }])
+            logger.info(f"Custom action guidance: {response.content}")
+            return {"output": f"Custom action guidance: {response.content}"}
+
+    def update_state(self, state: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
+        # Add missing update_state method to update the state
+        state.update(updates)
+        return state
